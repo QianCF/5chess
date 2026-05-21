@@ -1,0 +1,533 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>五子棋（黑白版）</title>
+  <style>
+    :root {
+      --bg: #fff;
+      --fg: #000;
+      --line: #000;
+      --panel-border: #000;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Microsoft YaHei", sans-serif;
+      background: var(--bg);
+      color: var(--fg);
+      display: flex;
+      justify-content: center;
+      padding: 24px;
+    }
+    .app {
+      width: 100%;
+      border: 1px solid var(--panel-border);
+      padding: 16px;
+    }
+    .title {
+      margin: 0 0 12px;
+      font-size: 20px;
+      font-weight: 700;
+    }
+    .toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+      margin-bottom: 12px;
+    }
+    button, select {
+      border: 1px solid #000;
+      background: #fff;
+      color: #000;
+      cursor: pointer;
+      padding: 4px 8px;
+    }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .status {
+      min-height: 28px;
+      border: 1px solid #000;
+      padding: 6px 8px;
+      margin-bottom: 12px;
+      white-space: pre-wrap;
+    }
+    .board-wrap {
+      border: 1px solid #000;
+      padding: 12px;
+      overflow: auto;
+      display: flex;
+      justify-content: center;
+    }
+    /* 正方形容器 - 使用外层包裹 */
+    .square-container {
+      position: relative;
+      width: min(97%, 720px);
+      max-width: 100%;
+    }
+    /* 使用 padding 技巧让容器保持正方形 */
+    .square-container::before {
+      content: "";
+      display: block;
+      padding-bottom: 100%;
+    }
+    /* grid 容器绝对定位填满正方形区域 */
+    .board-grid {
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      display: grid;
+      gap: 0;
+      background: #fff;
+      border: 2px solid #000;
+      user-select: none;
+      touch-action: manipulation;
+    }
+    .cell {
+      width: 100%;
+      height: 100%;
+      position: relative;
+      cursor: pointer;
+      border: 1px solid #000;
+      /* 兼容旧浏览器的flex居中 */
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .stone {
+      position: absolute;
+      top: 5%;
+      left: 5%;
+      width: 90%;
+      height: 90%;
+      border-radius: 50%;
+      pointer-events: none;
+    }
+    .stone.black { background: #000; }
+    .stone.white { background: #fff; border: 1px solid #000; }
+    /* 上一手：黑子中心白点、白子中心黑点 */
+    .stone.last-move::after {
+      content: "";
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      width: 30%;
+      height: 30%;
+      border-radius: 50%;
+      pointer-events: none;
+    }
+    .stone.black.last-move::after { background: #fff; }
+    .stone.white.last-move::after { background: #000; }
+    .cell.locked { cursor: not-allowed; }
+    .hint {
+      margin-top: 10px;
+      font-size: 12px;
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <h1 class="title">五子棋（你=黑子，AI=白子）</h1>
+    <div class="toolbar">
+      <label>
+        棋盘大小
+        <select id="sizeSelect">
+          <option value="11">11</option>
+          <option value="13">13</option>
+          <option value="15" selected>15</option>
+          <option value="19">19</option>
+        </select>
+      </label>
+      <button id="restartBtn" type="button">重新开始</button>
+      <button id="aiFirstBtn" type="button">AI先手</button>
+      <label style="display:inline-flex;align-items:center;gap:6px;">
+        <input type="checkbox" id="devModeCheckbox" />
+        开发者模式
+      </label>
+    </div>
+    <div class="status" id="status"></div>
+    <div class="board-wrap">
+      <div class="square-container">
+        <div id="board" class="board-grid" aria-label="五子棋棋盘"></div>
+      </div>
+    </div>
+    <div class="hint" id="hintText">操作：点击空位落子。若 AI 正在计算，将临时锁定落子。</div>
+  </div>
+
+  <script>
+    "use strict";
+
+    const CELL_EMPTY = 0;
+    const CELL_HUMAN = 1;
+    const CELL_AI = 2;
+
+    const state = {
+      size: 15,
+      board: [],
+      gameOver: false,
+      waitingAI: false,
+      humanTurn: true,
+      worker: null,
+      lastReason: "",
+      devMode: false,
+      /** askAIMove 发出瞬间的棋盘 JSON，用于丢弃重开/编辑后的过期 Worker 回复 */
+      pendingAiBoardJson: null,
+      /** 上一手落子坐标，用于盘面标记 */
+      lastMove: null
+    };
+
+    const statusEl = document.getElementById("status");
+    const boardEl = document.getElementById("board");
+    const sizeSelect = document.getElementById("sizeSelect");
+    const restartBtn = document.getElementById("restartBtn");
+    const aiFirstBtn = document.getElementById("aiFirstBtn");
+    const devModeCheckbox = document.getElementById("devModeCheckbox");
+    const hintText = document.getElementById("hintText");
+
+    function assert(cond, msg) {
+      if (!cond) throw new Error(msg);
+    }
+
+    function createBoard(size) {
+      assert(Number.isInteger(size) && size >= 5, "棋盘大小非法。");
+      return Array.from({ length: size }, () => Array(size).fill(CELL_EMPTY));
+    }
+
+    function inBounds(r, c, size) {
+      return r >= 0 && r < size && c >= 0 && c < size;
+    }
+
+    function isBoardFull(board) {
+      for (let r = 0; r < board.length; r++) {
+        for (let c = 0; c < board.length; c++) {
+          if (board[r][c] === CELL_EMPTY) return false;
+        }
+      }
+      return true;
+    }
+
+    function hasWinner(board, player) {
+      const n = board.length;
+      const dirs = [[0, 1], [1, 0], [1, 1], [1, -1]];
+      for (let r = 0; r < n; r++) {
+        for (let c = 0; c < n; c++) {
+          if (board[r][c] !== player) continue;
+          for (const [dr, dc] of dirs) {
+            let len = 0;
+            let rr = r;
+            let cc = c;
+            while (inBounds(rr, cc, n) && board[rr][cc] === player) {
+              len++;
+              rr += dr;
+              cc += dc;
+            }
+            if (len >= 5) return true;
+          }
+        }
+      }
+      return false;
+    }
+
+    function setStatus(text) {
+      statusEl.textContent = text;
+    }
+
+    function disposeWorker() {
+      if (state.worker) {
+        state.worker.terminate();
+        state.worker = null;
+      }
+    }
+
+    function rebuildBoardGrid() {
+      const n = state.size;
+      boardEl.innerHTML = "";
+      boardEl.style.gridTemplateColumns = `repeat(${n}, 1fr)`;
+      boardEl.style.gridTemplateRows = `repeat(${n}, 1fr)`;
+
+      const frag = document.createDocumentFragment();
+      for (let r = 0; r < n; r++) {
+        for (let c = 0; c < n; c++) {
+          const cell = document.createElement("div");
+          cell.className = "cell";
+          cell.dataset.row = String(r);
+          cell.dataset.col = String(c);
+          cell.setAttribute("aria-label", `第${r + 1}行第${c + 1}列`);
+          frag.appendChild(cell);
+        }
+      }
+      boardEl.appendChild(frag);
+    }
+
+    function drawBoard() {
+      const board = state.board;
+      const n = state.size;
+      if (!Array.isArray(board) || board.length !== n) {
+        throw new Error("棋盘数据未初始化。");
+      }
+      const cells = boardEl.querySelectorAll(".cell");
+      if (cells.length !== n * n) {
+        throw new Error("棋盘 DOM 与数据不同步。");
+      }
+
+      const locked =
+        !state.devMode && (state.gameOver || state.waitingAI || !state.humanTurn);
+      for (let r = 0; r < n; r++) {
+        for (let c = 0; c < n; c++) {
+          const idx = r * n + c;
+          const cellEl = cells[idx];
+          const v = board[r][c];
+          cellEl.classList.toggle("locked", locked);
+          cellEl.innerHTML = "";
+          const isLastMove =
+            state.lastMove &&
+            state.lastMove.row === r &&
+            state.lastMove.col === c;
+          if (v === CELL_HUMAN) {
+            const stone = document.createElement("span");
+            stone.className = "stone black" + (isLastMove ? " last-move" : "");
+            cellEl.appendChild(stone);
+          } else if (v === CELL_AI) {
+            const stone = document.createElement("span");
+            stone.className = "stone white" + (isLastMove ? " last-move" : "");
+            cellEl.appendChild(stone);
+          } else if (v !== CELL_EMPTY) {
+            throw new Error("未知棋子值。");
+          }
+        }
+      }
+    }
+
+    function placeStone(row, col, player) {
+      assert(inBounds(row, col, state.size), "落子越界。");
+      if (state.board[row][col] !== CELL_EMPTY) {
+        throw new Error("该位置已有棋子。");
+      }
+      state.board[row][col] = player;
+      state.lastMove = { row, col };
+    }
+
+    function updateHintText() {
+      if (state.devMode) {
+        hintText.textContent =
+          "开发者模式：点击格子在 空 → 黑 → 白 → 空 间循环，不落子、不触发 AI。";
+      } else {
+        hintText.textContent =
+          "操作：点击空位落子。若 AI 正在计算，将临时锁定落子。";
+      }
+    }
+
+    function updateTurnStatus(extra = "") {
+      if (state.devMode) {
+        setStatus("开发者模式已开启（编辑棋盘）\n\n\n");
+        return;
+      }
+      if (state.gameOver) return;
+      if (state.waitingAI) {
+        setStatus("AI 计算中...\n\n\n");
+        return;
+      }
+      const base = state.humanTurn ? "你的回合（黑子）" : "AI 回合（白子）";
+      setStatus(extra ? `${base}\n${extra}` : base+"\n\n\n");
+    }
+
+    function endWith(text) {
+      state.gameOver = true;
+      state.waitingAI = false;
+      state.pendingAiBoardJson = null;
+      setStatus(text);
+      drawBoard();
+    }
+
+    function ensureWorker() {
+      if (state.worker) return;
+      state.worker = new Worker("./5chess.worker.js");
+      state.worker.onmessage = (ev) => {
+        const data = ev.data;
+        if (!data || data.type !== "move") {
+          endWith("Worker 返回数据非法，游戏终止。");
+          return;
+        }
+        if (state.devMode) {
+          state.waitingAI = false;
+          state.pendingAiBoardJson = null;
+          drawBoard();
+          updateTurnStatus();
+          return;
+        }
+        if (!state.waitingAI || state.gameOver) return;
+        if (state.pendingAiBoardJson != null) {
+          if (JSON.stringify(state.board) !== state.pendingAiBoardJson) {
+            state.waitingAI = false;
+            state.pendingAiBoardJson = null;
+            drawBoard();
+            updateTurnStatus();
+            return;
+          }
+        }
+        state.waitingAI = false;
+        state.pendingAiBoardJson = null;
+
+        try {
+          const { row, col, reason } = data;
+          placeStone(row, col, CELL_AI);
+          state.lastReason = String(reason || "");
+          drawBoard();
+
+          if (hasWinner(state.board, CELL_AI)) {
+            endWith(`AI 获胜。\nAI 落子：${row + 1}, ${col + 1}\n${state.lastReason}`);
+            return;
+          }
+          if (isBoardFull(state.board)) {
+            endWith("平局。");
+            return;
+          }
+          state.humanTurn = true;
+          drawBoard();
+          updateTurnStatus(`AI 落子：${row + 1}, ${col + 1}\n${state.lastReason}`);
+        } catch (err) {
+          endWith(`处理 AI 结果失败：${err.message}`);
+        }
+      };
+      state.worker.onerror = (err) => {
+        endWith(`Worker 异常：${err.message}`);
+      };
+    }
+
+    function askAIMove() {
+      ensureWorker();
+      state.pendingAiBoardJson = JSON.stringify(state.board);
+      state.waitingAI = true;
+      drawBoard();
+      updateTurnStatus();
+      state.worker.postMessage({
+        type: "computeMove",
+        board: state.board,
+        ai: CELL_AI,
+        opponent: CELL_HUMAN
+      });
+    }
+
+    function startGame(aiFirst = false) {
+      disposeWorker();
+      state.pendingAiBoardJson = null;
+      state.devMode = devModeCheckbox.checked;
+      state.size = Number(sizeSelect.value);
+      if (!Number.isInteger(state.size) || state.size < 5) {
+        throw new Error("棋盘大小非法。");
+      }
+      state.board = createBoard(state.size);
+      state.gameOver = false;
+      state.waitingAI = false;
+      state.humanTurn = !aiFirst;
+      state.lastReason = "";
+      state.lastMove = null;
+      rebuildBoardGrid();
+      drawBoard();
+      updateHintText();
+      updateTurnStatus();
+      if (aiFirst) {
+        askAIMove();
+      }
+    }
+
+    boardEl.addEventListener("click", (ev) => {
+      const target = ev.target;
+      const cellEl = target instanceof Element ? target.closest(".cell") : null;
+      if (!(cellEl instanceof HTMLElement)) return;
+
+      try {
+        const rowRaw = cellEl.dataset.row;
+        const colRaw = cellEl.dataset.col;
+        if (typeof rowRaw !== "string" || typeof colRaw !== "string") {
+          throw new Error("单元格坐标缺失。");
+        }
+        const row = Number(rowRaw);
+        const col = Number(colRaw);
+        if (!Number.isInteger(row) || !Number.isInteger(col)) {
+          throw new Error("单元格坐标非法。");
+        }
+        if (!inBounds(row, col, state.size)) {
+          throw new Error("单元格坐标越界。");
+        }
+
+        if (state.devMode) {
+          const v = state.board[row][col];
+          const next =
+            v === CELL_EMPTY ? CELL_HUMAN : v === CELL_HUMAN ? CELL_AI : CELL_EMPTY;
+          state.board[row][col] = next;
+          state.lastMove =
+            next === CELL_EMPTY ? null : { row, col };
+          drawBoard();
+          updateTurnStatus();
+          return;
+        }
+
+        if (state.gameOver || state.waitingAI || !state.humanTurn) return;
+        if (state.board[row][col] !== CELL_EMPTY) return;
+
+        placeStone(row, col, CELL_HUMAN);
+        drawBoard();
+
+        if (hasWinner(state.board, CELL_HUMAN)) {
+          endWith(`你赢了！\n你的落子：${row + 1}, ${col + 1}`);
+          return;
+        }
+        if (isBoardFull(state.board)) {
+          endWith("平局。");
+          return;
+        }
+
+        state.humanTurn = false;
+        askAIMove();
+      } catch (err) {
+        setStatus(`落子失败：${err.message}`);
+      }
+    });
+
+    restartBtn.addEventListener("click", () => {
+      try {
+        startGame(false);
+      } catch (err) {
+        setStatus(`重开失败：${err.message}`);
+      }
+    });
+
+    aiFirstBtn.addEventListener("click", () => {
+      try {
+        startGame(true);
+      } catch (err) {
+        setStatus(`启动失败：${err.message}`);
+      }
+    });
+
+    sizeSelect.addEventListener("change", () => {
+      try {
+        startGame(false);
+      } catch (err) {
+        setStatus(`切换棋盘失败：${err.message}`);
+      }
+    });
+
+    devModeCheckbox.addEventListener("change", () => {
+      state.devMode = devModeCheckbox.checked;
+      if (state.devMode && state.waitingAI) {
+        disposeWorker();
+        state.waitingAI = false;
+        state.pendingAiBoardJson = null;
+        state.humanTurn = true;
+      }
+      updateHintText();
+      drawBoard();
+      updateTurnStatus();
+    });
+
+    updateHintText();
+    startGame(false);
+  </script>
+</body>
+</html>
